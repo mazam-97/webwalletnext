@@ -28,15 +28,14 @@ export const GenerateWallet= async (
         const {key:derivedSeed} = derivePath(path, seed.toString("hex"))
         const secret = nacl.sign.keyPair.fromSeed(derivedSeed).secretKey;
         const keypair = Keypair.fromSecretKey(secret);
-        encodedPublicKey=base58.encode(secret).toString();
-        encodedPrivateKey=keypair.publicKey.toBase58();
-        console.log(encodedPrivateKey);
+        // Standard: publicKey = base58(pubkey), privateKey = base58(secretKey)
+        encodedPublicKey = keypair.publicKey.toBase58();
+        encodedPrivateKey = base58.encode(secret).toString();
 
     }
     else if(walletType==="Etherium"){
-         path = `m/44'/60'/${index}'/0'`;
-        //@ts-ignore
-        console.log("seed in eth"+seed);
+        // Standard BIP44 (MetaMask compatible): m/44'/60'/0'/0/index
+        path = `m/44'/60'/0'/0/${index}`;
         const hdNode = HDNodeWallet.fromSeed(seed);
         const child = hdNode.derivePath(path);
          encodedPrivateKey = child.privateKey;

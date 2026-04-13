@@ -1,6 +1,6 @@
 "use client"
 import { useState } from "react";
-import { generateMnemonic } from 'bip39';
+import { generateMnemonic, validateMnemonic } from 'bip39';
 import { Button, SecondaryButton } from "@/components/ui/Button";
 import { useRouter } from "next/navigation";
 import {DisplayMnemonic} from "@/components/DisplayMnemonic";
@@ -11,6 +11,37 @@ import { Wallet } from "ethers";
 import { Fascinate } from "next/font/google";
 import PrivateKeyToggle from "@/components/PrivateKeyToggle";
 
+type SavedRecoverCounts = { Etherium: number; Solana: number };
+const RECOVER_STORAGE_KEY = "webwalletnext.recoverCounts.v1";
+
+async function mnemonicId(mnemonic: string) {
+  const normalized = mnemonic.trim().toLowerCase().replace(/\s+/g, " ");
+  const data = new TextEncoder().encode(normalized);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function readRecoverCountsFromStorage(): Record<string, SavedRecoverCounts> {
+  try {
+    const raw = localStorage.getItem(RECOVER_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, SavedRecoverCounts>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeRecoverCountsToStorage(data: Record<string, SavedRecoverCounts>) {
+  try {
+    localStorage.setItem(RECOVER_STORAGE_KEY, JSON.stringify(data));
+  } catch {
+    // ignore (storage may be disabled)
+  }
+}
+
 export default function Home() {
 
   const [isExpand, setExpand] = useState<boolean>(false);
@@ -19,9 +50,53 @@ export default function Home() {
   
   const router=useRouter();
   const [mnemonic, setMnemonic] = useState<string>("");
+  const [mnemonicInput, setMnemonicInput] = useState<string>("");
+  const [mnemonicError, setMnemonicError] = useState<string>("");
   async function onClickHandler(){
     let mn=await generateMnemonic();
     setMnemonic(mn);
+    setMnemonicInput("");
+    setMnemonicError("");
+  }
+  async function onRecoverHandler() {
+    const candidate = mnemonicInput.trim().replace(/\s+/g, " ");
+    if (!candidate) {
+      setMnemonicError("Enter your 12/24-word recovery phrase.");
+      return;
+    }
+    if (!validateMnemonic(candidate)) {
+      setMnemonicError("That recovery phrase is not valid. Check spelling and word order.");
+      return;
+    }
+    // Replace current session with the recovered wallet seed
+    setWallet([]);
+    setMnemonic(candidate);
+    setMnemonicError("");
+
+    const id = await mnemonicId(candidate);
+    const stored = readRecoverCountsFromStorage()[id];
+    const ethCount = Math.max(0, Math.min(200, stored?.Etherium ?? 0));
+    const solCount = Math.max(0, Math.min(200, stored?.Solana ?? 0));
+
+    // Recover exactly what was created in this browser for this seed.
+    // If there is no local history, we intentionally do not guess a number.
+    const finalEth = ethCount;
+    const finalSol = solCount;
+
+    if (finalEth === 0 && finalSol === 0) {
+      setMnemonicError(
+        "No wallet history found on this device for that recovery phrase. This app can only auto-recover the exact count it previously created in this browser.",
+      );
+      return;
+    }
+
+    const generated = await Promise.all([
+      ...Array.from({ length: finalEth }, (_, i) => GenerateWallet("Etherium", candidate, i)),
+      ...Array.from({ length: finalSol }, (_, i) => GenerateWallet("Solana", candidate, i)),
+    ]);
+
+    const recovered = generated.filter(Boolean) as WalletModel[];
+    setWallet(recovered);
   }
   
   const onDeleteHandler=(publickey:string)=>{
@@ -34,7 +109,8 @@ export default function Home() {
     setWallet([...walletUpdated ]);
   }
   const onWalletGenerate=async(walletType:WalletType)=>{
-   let newwallet= await (GenerateWallet(walletType,mnemonic,wallet?.filter(a=>a.type===walletType).length ?? 0 ));
+   const nextIndex = wallet?.filter(a=>a.type===walletType).length ?? 0;
+   let newwallet= await (GenerateWallet(walletType,mnemonic,nextIndex ));
    console.log('walletgenerated'+newwallet);
    if(wallet){
     let modWallet=[...wallet,newwallet];
@@ -42,6 +118,24 @@ export default function Home() {
     console.log(wallet);
    }
    console.log("wallet created"+wallet);
+
+   // Persist how many wallets have been created for this mnemonic in this browser,
+   // so recovery can recreate the full set automatically later.
+   try {
+     if (mnemonic) {
+       const id = await mnemonicId(mnemonic);
+       const all = readRecoverCountsFromStorage();
+       const prev = all[id] ?? { Etherium: 0, Solana: 0 };
+       const updated = {
+         ...prev,
+         [walletType]: Math.max(prev[walletType], nextIndex + 1),
+       } as SavedRecoverCounts;
+       all[id] = updated;
+       writeRecoverCountsToStorage(all);
+     }
+   } catch {
+     // ignore
+   }
   }
   return (
     <main className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-br from-blue-100 via-slate-100 to-purple-100 py-10 px-2">
@@ -52,7 +146,13 @@ export default function Home() {
       <div className="w-full max-w-2xl bg-white/80 rounded-2xl shadow-2xl p-8 mb-8 border border-slate-200">
         {mnemonic === ""
           ? (
-            <GenerateMnemonic onClick={onClickHandler} />
+            <GenerateMnemonic
+              onGenerate={onClickHandler}
+              onRecover={onRecoverHandler}
+              mnemonicInput={mnemonicInput}
+              setMnemonicInput={setMnemonicInput}
+              error={mnemonicError}
+            />
           ) : (
             <DisplayMnemonic mnemonic={mnemonic} />
           )}
@@ -66,7 +166,19 @@ export default function Home() {
     </main>
   );
 }
-const GenerateMnemonic = ({ onClick }: { onClick: () => void }) => {
+const GenerateMnemonic = ({
+  onGenerate,
+  onRecover,
+  mnemonicInput,
+  setMnemonicInput,
+  error,
+}: {
+  onGenerate: () => void;
+  onRecover: () => void;
+  mnemonicInput: string;
+  setMnemonicInput: (value: string) => void;
+  error: string;
+}) => {
   return (
     <div className="flex flex-col items-center w-full">
       <div className="w-full max-w-lg bg-gradient-to-br from-blue-50 via-white to-purple-50 rounded-2xl shadow-xl p-8 flex flex-col items-center gap-6 border border-slate-200">
@@ -83,12 +195,33 @@ const GenerateMnemonic = ({ onClick }: { onClick: () => void }) => {
         </p>
         <input
           type="text"
-          className="p-3 w-full rounded-lg border-2 border-slate-300 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition outline-none shadow-sm bg-slate-50 text-lg mb-2 placeholder-slate-400"
-          placeholder="Recover your wallet (or leave blank to generate)"
+          value={mnemonicInput}
+          onChange={(e) => setMnemonicInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onRecover();
+          }}
+          className="p-3 w-full rounded-lg border-2 border-slate-300 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition outline-none shadow-sm bg-slate-50 text-lg mb-1 placeholder-slate-400"
+          placeholder="Paste your recovery phrase to recover an existing wallet"
         />
-        <Button className="w-full py-3 text-lg font-semibold rounded-lg shadow-md bg-gradient-to-r from-blue-500 to-purple-500 hover:from-blue-600 hover:to-purple-600 transition text-white" onClick={onClick}>
-          Generate Mnemonic
-        </Button>
+        {error && (
+          <div className="w-full rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+            {error}
+          </div>
+        )}
+        <div className="w-full grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <Button
+            className="w-full py-3 text-lg font-semibold rounded-lg shadow-md bg-slate-900 text-white hover:bg-slate-800 transition"
+            onClick={onRecover}
+          >
+            Recover Wallet
+          </Button>
+          <Button
+            className="w-full py-3 text-lg font-semibold rounded-lg shadow-md bg-gradient-to-r from-blue-500 to-purple-500 hover:from-blue-600 hover:to-purple-600 transition text-white"
+            onClick={onGenerate}
+          >
+            Generate New
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -116,7 +249,7 @@ const DisplayWalletSection=({wallet,onWalletGenerate,onDelete,onDeleteAll}:
           setIsEthSelected(true);
           setIsSolSelected(false);
         }}
-        className={`px-8 py-3 text-white rounded-lg font-semibold text-lg shadow-md transition border-2 ${isEthSelected ? 'bg-blue-500 text-white border-blue-600' : 'bg-white text-blue-700 border-blue-300 hover:bg-blue-50'}`}
+        className={`px-8 py-3 rounded-lg font-semibold text-lg shadow-md transition border-2 ${isEthSelected ? 'bg-blue-500 text-white border-blue-600' : 'bg-white text-blue-700 border-blue-300 hover:bg-blue-50'}`}
       >
         Etherium
       </SecondaryButton>
@@ -127,7 +260,7 @@ const DisplayWalletSection=({wallet,onWalletGenerate,onDelete,onDeleteAll}:
           setIsSolSelected(true);
           setIsEthSelected(false);
         }}
-        className={`px-8 py-3 text-white rounded-lg font-semibold text-lg shadow-md transition border-2 ${isSolSelected ? 'bg-purple-500 text-white border-purple-600' : 'bg-white text-purple-700 border-purple-300 hover:bg-purple-50'}`}
+        className={`px-8 py-3 rounded-lg font-semibold text-lg shadow-md transition border-2 ${isSolSelected ? 'bg-purple-500 text-white border-purple-600' : 'bg-white text-purple-700 border-purple-300 hover:bg-purple-50'}`}
       >
         Solana
       </SecondaryButton>
